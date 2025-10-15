@@ -1,12 +1,12 @@
 const express = require('express');
 const path = require('path');
 const i18next = require('i18next');
-const ejs = require('ejs'); 
 const basicAuth = require('basic-auth');
 const https = require('https');
 const i18nextMiddleware = require('i18next-http-middleware');
 const Backend = require('i18next-fs-backend');
-
+const cookieParser = require('cookie-parser');
+const session = require('express-session');
 const HTTPS_PORT = 3443
 
 i18next
@@ -45,31 +45,114 @@ const PORT = process.env.PORT || 3000;
  */
 const API_PREFIX = process.env.API_PREFIX || '${API_PREFIX}';
 
-app.set('view engine', 'ejs');
+app.set('view engine');
 
 app.use(express.urlencoded({ extended: true }));
 
 app.use(i18nextMiddleware.handle(i18next));
 //Serve static files
-app.engine('ejs', ejs.__express);
 app.use(express.static(path.join(__dirname, '/public')));
 app.use(express.json());
+app.use(cookieParser());
 
-const auth = (req, res, next) => {
-    const credentials = basicAuth(req);
-
-    // Добавляем случайный realm или timestamp чтобы сбросить кэш
-    const realm = 'Lab 6 Authentication ' + Date.now();
-
-    if (!credentials || credentials.name !== 'admin' || credentials.pass !== 'password123') {
-        res.set('WWW-Authenticate', `Basic realm="${realm}"`);
-        return res.status(401).send('Требуется аутентификация');
-    } else {
-        next();
+app.use(session({
+    secret: 'lab7-secret-'+Date.now(),
+    resave: false,
+    saveUninitialized: true,
+    cookie: {
+        secure: false,
+        maxAge: 24 * 60 * 60 * 1000
     }
+}));
+
+app.use((req, res, next) => {
+    if (!req.session.visitCount){
+        req.session.visitCount = 0;
+    }
+    req.session.visitCount ++;
+    req.session.lastVisit = new Date().toLocaleString('ru-RU');
+    next();
+});
+
+//Аутентификация
+const auth = (req, res, next) => {
+    if (req.session && req.session.authenticated) {
+        return next();
+    }
+
+    if (req.path === '/login' || req.path === '/auth'){
+        return next();
+    }
+
+    res.redirect('/login');
 }
 
+app.get('/login', (req,res) => {
+    if (req.session.authenticated) {
+        return res.redirect('/');
+    }
+
+    res.sendFile(path.join(__dirname, '/public/views/login.html'));
+});
+
+app.post('/auth', express.urlencoded({ extended: true}), (req, res) => {
+    const {username, password} = req.body;
+
+    console.log('Auth attempt: ', {username, password});
+
+    if (username === 'admin' && password === 'password123'){
+        req.session.authenticated = true;
+        req.session.username = username;
+        console.log('Auth successful');
+        res.redirect('/');
+    }else{
+        console.log('Auth failed');
+        res.redirect('/login?error=Invalid credentials');
+    }
+});
+
+app.get('/logout', (req, res) => {
+    req.session.destroy((err) => {
+        if (err) {
+            console.log('Error destroying session: ', err);
+        }
+        res.redirect('/login');
+    });
+});
+
 app.use(auth);
+
+app.post('/save-preferences', auth, (req, res) => {
+    const { userName, bgColor } = req.body;
+
+    console.log('Saving preferences:', { userName, bgColor });
+
+    // Сохраняем в Cookie
+    res.cookie('userName', userName, { 
+        maxAge: 30 * 24 * 60 * 60 * 1000, //30 дней
+        httpOnly: false
+    });
+    res.cookie('bgColor', bgColor, { 
+        maxAge: 30 * 24 * 60 * 60 * 1000,
+        httpOnly: false
+    });
+    res.cookie('visitCount', req.session.visitCount, { 
+        maxAge: 30 * 24 * 60 * 60 * 1000,
+        httpOnly: false
+    });
+    res.cookie('lastVisit', req.session.lastVisit, { 
+        maxAge: 30 * 24 * 60 * 60 * 1000,
+        httpOnly: false
+    });
+
+    res.redirect('/profile');
+});
+
+app.get('/clear-cookies', auth, (req, res) => {
+    res.clearCookie('userName');
+    res.clearCookie('bgColor');
+    res.redirect('/preferences');
+});
 
 app.get('/change-language/:lng', auth, (req, res) => {
     res.json([
@@ -96,6 +179,10 @@ app.get('/', auth, (req, res) => {
     res.sendFile(path.join(__dirname, '/public/views/index.html'));
 });
 
+//GWT приложение
+app.get('/gwt-app', auth, (req, res) => {
+    res.sendFile(path.join(__dirname, '/public/views/gwt-app.html'));
+});
 
 //Страница со всеми элементавми
 app.get('/view-all', auth, (req, res) => {
@@ -117,9 +204,18 @@ app.get('/system-info', auth, (req, res) => {
     res.sendFile(path.join(__dirname, '/public/views/system-info.html'));
 });
 
+//Страница preferences
+app.get('/preferences', auth, (req, res) => {
+    res.sendFile(path.join(__dirname, '/public/views/preferences.html'));
+});
+//Страница profile
+app.get('/profile', auth, (req, res) => {
+    res.sendFile(path.join(__dirname, '/public/views/profile.html'));
+});
 app.get('/form', auth, (req, res) => {
     res.sendFile(path.join(__dirname, '/public/views/form.html'));
-})
+});
+
 /**
  * GET api/v1/items - Получить все эелементы
  * @param {express.Request} req - Объект запроса
@@ -159,6 +255,34 @@ app.get(`${API_PREFIX}/items/:id`, auth, (req, res) => {
         res.json(item);
 });
 
+//Удаление элемента
+app.delete(`${API_PREFIX}/items/:id`, auth, (req, res) => {
+    const id = parseInt(req.params.id);
+    const itemIndex = items.findIndex(item => item.id === id);
+
+    if (itemIndex === -1){
+        return res.status(404).json({ error: 'Элемент не найден' });
+    }
+
+    const deletedItem = items.splice(itemIndex, 1)[0];
+    res.json({ message: 'Элемент удален', item: deletedItem});
+})
+
+app.get(`${API_PREFIX}/stats`, auth, (req, res) => {
+    const totalItems = items.length;
+    const totalValue = items.reduce((sum, item) => sum + item.value, 0);
+    const avgValue = totalItems > 0 ? totalValue / totalItems : 0;
+
+    res.json({
+        totalItems,
+        totalValue,
+        avgValue: Math.round(avgValue * 100) / 100,
+        itemsByValue: items.map(item => ({
+            name: item.name,
+            value: item.value
+        }))
+    });
+});
 /**
  * POST /api/v1/items - Создать новый элемент
  * @param {express.Request} req - Объекта запроса
